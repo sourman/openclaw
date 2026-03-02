@@ -25,6 +25,10 @@ import { logInboundDrop } from "../../../channels/logging.js";
 import { resolveMentionGatingWithBypass } from "../../../channels/mention-gating.js";
 import { recordInboundSession } from "../../../channels/session.js";
 import { readSessionUpdatedAt, resolveStorePath } from "../../../config/sessions.js";
+import {
+  evaluateSessionFreshness,
+  resolveSessionResetPolicy,
+} from "../../../config/sessions/reset.js";
 import { logVerbose, shouldLogVerbose } from "../../../globals.js";
 import { enqueueSystemEvent } from "../../../infra/system-events.js";
 import { resolveAgentRoute } from "../../../routing/resolve-route.js";
@@ -515,6 +519,8 @@ export async function prepareSlackMessage(params: {
   let threadSessionPreviousTimestamp: number | undefined;
   let threadLabel: string | undefined;
   let threadStarterMedia: Awaited<ReturnType<typeof resolveSlackMedia>> = null;
+  // Track if this is effectively a new session (truly new or stale) for thread context loading
+  let isEffectivelyNewSession = false;
   if (isThreadReply && threadTs) {
     const starter = await resolveSlackThreadStarter({
       channelId: message.channel,
@@ -552,8 +558,27 @@ export async function prepareSlackMessage(params: {
       storePath,
       sessionKey, // Thread-specific session key
     });
-    // Only fetch thread history for NEW sessions (existing sessions already have this context in their transcript)
-    if (threadInitialHistoryLimit > 0 && !threadSessionPreviousTimestamp) {
+    // Determine if this is effectively a new session (either truly new or stale):
+    // - No previous timestamp = truly new session
+    // - Previous timestamp exists but session is stale (will be reset by initSessionState)
+    isEffectivelyNewSession = !threadSessionPreviousTimestamp;
+    if (threadSessionPreviousTimestamp) {
+      // Session exists - check if it's stale (will be reset)
+      const resetPolicy = resolveSessionResetPolicy({
+        sessionCfg: ctx.cfg.session,
+        resetType: "thread",
+        resetOverride: ctx.channelReset,
+      });
+      const freshness = evaluateSessionFreshness({
+        updatedAt: threadSessionPreviousTimestamp,
+        now: Date.now(),
+        policy: resetPolicy,
+      });
+      // If session is stale, initSessionState will create a new session
+      isEffectivelyNewSession = !freshness.fresh;
+    }
+    // Only fetch thread history for NEW or STALE sessions (fresh sessions already have this context in their transcript)
+    if (threadInitialHistoryLimit > 0 && isEffectivelyNewSession) {
       const threadHistory = await resolveSlackThreadHistory({
         channelId: message.channel,
         threadTs,
@@ -643,11 +668,10 @@ export async function prepareSlackMessage(params: {
     // Preserve thread context for routed tool notifications.
     MessageThreadId: threadContext.messageThreadId,
     ParentSessionKey: threadKeys.parentSessionKey,
-    // Only include thread starter body for NEW sessions (existing sessions already have it in their transcript)
-    ThreadStarterBody: !threadSessionPreviousTimestamp ? threadStarterBody : undefined,
+    // Only include thread starter body for NEW or STALE sessions (fresh sessions already have it in their transcript)
+    ThreadStarterBody: isEffectivelyNewSession ? threadStarterBody : undefined,
     ThreadHistoryBody: threadHistoryBody,
-    IsFirstThreadTurn:
-      isThreadReply && threadTs && !threadSessionPreviousTimestamp ? true : undefined,
+    IsFirstThreadTurn: isThreadReply && threadTs && isEffectivelyNewSession ? true : undefined,
     ThreadLabel: threadLabel,
     Timestamp: message.ts ? Math.round(Number(message.ts) * 1000) : undefined,
     WasMentioned: isRoomish ? effectiveWasMentioned : undefined,
